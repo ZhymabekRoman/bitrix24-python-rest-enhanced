@@ -8,10 +8,11 @@ import asyncio
 import itertools
 import ssl
 import warnings
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
 from aiohttp import ClientSession, TCPConnector
+from loguru import logger
 
 from .exceptions import BitrixError
 
@@ -47,15 +48,21 @@ class Bitrix24:
         self._fetch_all_pages = bool(fetch_all_pages)
         self._retry_after = int(retry_after)
         self._verify_ssl = bool(safe)
+        logger.info(f"Bitrix24 API initialized with domain: {self._domain}")
 
     @staticmethod
     def _prepare_domain(domain: str) -> str:
         """Normalize user passed domain to a valid one."""
         o = urlparse(domain)
         if not o.scheme or not o.netloc:
+            logger.error(f"Invalid domain provided: {domain}")
             raise BitrixError("Not a valid domain. Please provide a valid domain.")
         user_id, code = o.path.split("/")[2:4]
-        return "{0}://{1}/rest/{2}/{3}".format(o.scheme, o.netloc, user_id, code)
+        prepared_domain = "{0}://{1}/rest/{2}/{3}".format(
+            o.scheme, o.netloc, user_id, code
+        )
+        logger.debug(f"Prepared domain: {prepared_domain}")
+        return prepared_domain
 
     def _prepare_params(self, params: Dict[str, Any], prev: str = "") -> str:
         """
@@ -77,7 +84,9 @@ class Bitrix24:
                     if prev:
                         key = "{0}[{1}]".format(prev, key)
                     ret += self._prepare_params(value, key)
-                elif (isinstance(value, list) or isinstance(value, tuple)) and len(value) > 0:
+                elif (isinstance(value, list) or isinstance(value, tuple)) and len(
+                    value
+                ) > 0:
                     for offset, val in enumerate(value):
                         if isinstance(val, dict):
                             ret += self._prepare_params(
@@ -85,7 +94,9 @@ class Bitrix24:
                             )
                         else:
                             if prev:
-                                ret += "{0}[{1}][{2}]={3}&".format(prev, key, offset, val)
+                                ret += "{0}[{1}][{2}]={3}&".format(
+                                    prev, key, offset, val
+                                )
                             else:
                                 ret += "{0}[{1}]={2}&".format(key, offset, val)
                 else:
@@ -93,29 +104,41 @@ class Bitrix24:
                         ret += "{0}[{1}]={2}&".format(prev, key, value)
                     else:
                         ret += "{0}={1}&".format(key, value)
+        logger.debug(f"Prepared parameters: {ret}")
         return ret
 
-    async def request(self, method: str, params: str = None) -> Dict[str, Any]:
+    async def request(
+        self, method: str, params: Optional[str] = None
+    ) -> Dict[str, Any]:
         ssl_context = ssl.create_default_context()
         if not self._verify_ssl:
             ssl_context.check_hostname = False
             ssl_context.verify_mode = ssl.CERT_NONE
+            logger.warning("SSL verification is disabled")
         async with ClientSession(connector=TCPConnector(ssl=ssl_context)) as session:
-            async with session.get(
-                f"{self._domain}/{method}.json", params=params, timeout=self._timeout
-            ) as resp:
+            url = f"{self._domain}/{method}.json"
+            logger.info(f"Making request to: {url}")
+            async with session.get(url, params=params, timeout=self._timeout) as resp:
+                logger.info(f"Response received with status: {resp.status}")
+                logger.debug(f"Response text: {await resp.text()}")
                 if resp.status not in [200, 201]:
+                    logger.error(f"HTTP error: {resp.status}")
                     raise BitrixError(f"HTTP error: {resp.status}")
                 response = await resp.json()
                 if "error" in response:
                     if response["error"] == "QUERY_LIMIT_EXCEEDED":
+                        logger.warning(
+                            f"Query limit exceeded. Retrying after {self._retry_after} seconds"
+                        )
                         await asyncio.sleep(self._retry_after)
                         return await self.request(method, params)
+                    logger.error(f"Bitrix error: {response['error_description']}")
                     raise BitrixError(response["error_description"], response["error"])
+                logger.debug(f"Response received: {response}")
                 return response
 
     async def _call(
-            self, method: str, params: Dict[str, Any] = None, start: int = 0
+        self, method: str, params: Dict[str, Any] = None, start: int = 0
     ) -> Dict[str, Any]:
         """Async call a REST method with specified parameters.
 
@@ -130,6 +153,7 @@ class Bitrix24:
         params["start"] = start
 
         payload = self._prepare_params(params)
+        logger.info(f"Calling method: {method} with start: {start}")
         res = await self.request(method, payload)
 
         if "next" in res and not start and self._fetch_all_pages:
@@ -138,11 +162,15 @@ class Bitrix24:
             else:
                 count_tasks = res["total"] // 50
 
+            logger.info(
+                f"Fetching all pages for method: {method}. Total tasks: {count_tasks}"
+            )
             tasks = [
                 self._call(method, params, (s + 1) * 50) for s in range(count_tasks)
             ]
             items = await asyncio.gather(*tasks)
             if type(res["result"]) is not dict:
+                logger.debug("Combining results from all pages")
                 return res["result"] + list(itertools.chain(*items))
             if items:
                 key = list(res["result"].keys())[0]
@@ -150,7 +178,9 @@ class Bitrix24:
                     res["result"][key] += item[key]
         return res["result"]
 
-    def callMethod(self, method: str, params: Dict[str, Any] = None, **kwargs) -> Dict[str, Any]:
+    def callMethod(
+        self, method: str, params: Dict[str, Any] = None, **kwargs
+    ) -> Dict[str, Any]:
         """Call a REST method with specified parameters.
 
         Parameters
@@ -166,6 +196,7 @@ class Bitrix24:
             params = {}
 
         if not method:
+            logger.error("Wrong method name provided")
             raise BitrixError("Wrong method name", 400)
 
         try:
@@ -177,6 +208,9 @@ class Bitrix24:
                 "Please consider updating your code",
                 DeprecationWarning,
             )
+            logger.warning(
+                "callMethod is being used synchronously. This will change in version 3."
+            )
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
@@ -184,5 +218,6 @@ class Bitrix24:
             finally:
                 loop.close()
         else:
+            logger.info(f"Calling method asynchronously: {method}")
             result = asyncio.ensure_future(self._call(method, params or kwargs))
         return result
