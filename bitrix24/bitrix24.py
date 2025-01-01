@@ -6,12 +6,11 @@
 
 import asyncio
 import itertools
-import ssl
 import warnings
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
-from aiohttp import ClientSession, TCPConnector
+from aiohttp import ClientSession
 from loguru import logger
 
 from .exceptions import BitrixError
@@ -28,9 +27,9 @@ class Bitrix24:
         self,
         domain: str,
         timeout: int = 60,
-        safe: bool = True,
         fetch_all_pages: bool = True,
         retry_after: int = 3,
+        session: Optional[ClientSession] = None,
     ):
         """
         Create Bitrix24 API object.
@@ -39,15 +38,15 @@ class Bitrix24:
         ----------
             domain (str): Bitrix24 webhook domain
             timeout (int): Timeout for API request in seconds
-            safe (bool): Set to `False` to ignore the certificate verification
             fetch_all_pages (bool): Fetch all pages for paginated requests
             retry_after (int): Retry after seconds for QUERY_LIMIT_EXCEEDED error
+            session (Optional[ClientSession]): Optional aiohttp ClientSession instance
         """
         self._domain = self._prepare_domain(domain)
         self._timeout = int(timeout)
         self._fetch_all_pages = bool(fetch_all_pages)
         self._retry_after = int(retry_after)
-        self._verify_ssl = bool(safe)
+        self._session = session
         logger.info(f"Bitrix24 API initialized with domain: {self._domain}")
 
     @staticmethod
@@ -110,12 +109,14 @@ class Bitrix24:
     async def request(
         self, method: str, params: Optional[str] = None
     ) -> Dict[str, Any]:
-        ssl_context = ssl.create_default_context()
-        if not self._verify_ssl:
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
-            logger.warning("SSL verification is disabled")
-        async with ClientSession(connector=TCPConnector(ssl=ssl_context)) as session:
+        if self._session:
+            session = self._session
+            should_close = False
+        else:
+            session = ClientSession()
+            should_close = True
+
+        try:
             url = f"{self._domain}/{method}.json"
             logger.info(f"Making request to: {url}")
             async with session.get(url, params=params, timeout=self._timeout) as resp:
@@ -136,6 +137,9 @@ class Bitrix24:
                     raise BitrixError(response["error_description"], response["error"])
                 logger.debug(f"Response received: {response}")
                 return response
+        finally:
+            if should_close:
+                await session.close()
 
     async def _call(
         self, method: str, params: Dict[str, Any] = None, start: int = 0
